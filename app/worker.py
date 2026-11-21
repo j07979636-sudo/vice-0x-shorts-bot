@@ -1,8 +1,7 @@
 
 """VICE_0X background worker.
 
-Processes due video jobs through the transcription and editing pipeline.
-YouTube publishing is handled as a separate stage.
+Processes scheduled videos and tracks YouTube upload results.
 """
 
 import logging
@@ -10,6 +9,7 @@ import os
 import re
 import socket
 import time
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,7 +24,7 @@ WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 
 def initialize_jobs_table():
-    """Create the scheduled jobs table and migrate older databases."""
+    """Create and migrate the scheduled jobs table."""
 
     initialize_database()
 
@@ -39,7 +39,9 @@ def initialize_jobs_table():
                 claimed_at TEXT,
                 worker_id TEXT,
                 error_message TEXT,
-                processed_path TEXT
+                processed_path TEXT,
+                youtube_video_id TEXT,
+                youtube_url TEXT
             )
         """)
 
@@ -55,6 +57,8 @@ def initialize_jobs_table():
             "worker_id": "TEXT",
             "error_message": "TEXT",
             "processed_path": "TEXT",
+            "youtube_video_id": "TEXT",
+            "youtube_url": "TEXT",
         }
 
         for name, definition in migrations.items():
@@ -105,6 +109,7 @@ def add_job(video_path: str, scheduled_time: str) -> int:
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+
         connection.commit()
         return cursor.lastrowid
 
@@ -116,6 +121,7 @@ def claim_due_jobs(limit: int = 5) -> list[dict]:
         raise ValueError("Job limit must be a positive integer.")
 
     initialize_jobs_table()
+
     now = datetime.now(timezone.utc).isoformat()
     claimed = []
 
@@ -124,7 +130,8 @@ def claim_due_jobs(limit: int = 5) -> list[dict]:
 
         rows = connection.execute(
             """
-            SELECT id FROM scheduled_jobs
+            SELECT id
+            FROM scheduled_jobs
             WHERE status = 'pending'
               AND scheduled_time <= ?
             ORDER BY scheduled_time ASC
@@ -141,7 +148,8 @@ def claim_due_jobs(limit: int = 5) -> list[dict]:
                     claimed_at = ?,
                     worker_id = ?,
                     error_message = NULL
-                WHERE id = ? AND status = 'pending'
+                WHERE id = ?
+                  AND status = 'pending'
                 """,
                 (now, WORKER_ID, row["id"]),
             )
@@ -151,6 +159,7 @@ def claim_due_jobs(limit: int = 5) -> list[dict]:
                     "SELECT * FROM scheduled_jobs WHERE id = ?",
                     (row["id"],),
                 ).fetchone()
+
                 claimed.append(dict(job))
 
         connection.commit()
@@ -163,8 +172,10 @@ def mark_job_status(
     status: str,
     error_message: str | None = None,
     processed_path: str | None = None,
-) -> None:
-    """Update a job's status and processing result."""
+    youtube_video_id: str | None = None,
+    youtube_url: str | None = None,
+):
+    """Update job status and save upload information."""
 
     allowed = {"pending", "processing", "completed", "failed"}
 
@@ -178,6 +189,8 @@ def mark_job_status(
             SET status = ?,
                 error_message = ?,
                 processed_path = COALESCE(?, processed_path),
+                youtube_video_id = COALESCE(?, youtube_video_id),
+                youtube_url = COALESCE(?, youtube_url),
                 claimed_at = CASE
                     WHEN ? = 'processing' THEN claimed_at
                     ELSE NULL
@@ -192,11 +205,14 @@ def mark_job_status(
                 status,
                 error_message[:1000] if error_message else None,
                 processed_path,
+                youtube_video_id,
+                youtube_url,
                 status,
                 status,
                 job_id,
             ),
         )
+
         connection.commit()
 
 
@@ -224,12 +240,13 @@ def recover_stale_jobs():
             """,
             (cutoff,),
         )
+
         connection.commit()
         return cursor.rowcount
 
 
-def process_job(job: dict) -> None:
-    """Process a claimed video through the application pipeline."""
+def process_job(job: dict):
+    """Process a video and upload the finished Short."""
 
     job_id = job["id"]
     source = Path(job["video_path"])
@@ -240,8 +257,8 @@ def process_job(job: dict) -> None:
                 f"Scheduled video no longer exists: {source}"
             )
 
-        # Derive a basic topic from the uploaded filename.
         topic = re.sub(r"[_-]+", " ", source.stem).strip()
+
         if not topic:
             topic = "Gaming Shorts"
 
@@ -250,7 +267,6 @@ def process_job(job: dict) -> None:
 
         output_path = output_dir / f"job_{job_id}_short.mp4"
 
-        # Import only when a job is ready to run.
         from app.pipeline import process_video
 
         result = process_video(
@@ -264,27 +280,46 @@ def process_job(job: dict) -> None:
         if not rendered.is_file() or rendered.stat().st_size == 0:
             raise RuntimeError("Pipeline did not produce a valid video.")
 
+        youtube = result.get("youtube")
+
+        if not isinstance(youtube, dict):
+            raise RuntimeError("YouTube upload result is missing.")
+
+        video_id = youtube.get("video_id")
+        video_url = youtube.get("url")
+
+        if not video_id or not video_url:
+            raise RuntimeError("YouTube upload confirmation is incomplete.")
+
         mark_job_status(
             job_id,
             "completed",
             processed_path=str(rendered.resolve()),
+            youtube_video_id=video_id,
+            youtube_url=video_url,
         )
 
         logger.info(
-            "Job %s completed. Output: %s",
+            "Job %s uploaded successfully: %s",
             job_id,
-            rendered,
+            video_url,
         )
 
     except Exception as exc:
         logger.exception("Job %s failed.", job_id)
-        mark_job_status(job_id, "failed", str(exc))
+
+        mark_job_status(
+            job_id,
+            "failed",
+            error_message=str(exc),
+        )
 
 
 def run_worker():
-    """Continuously claim and process due jobs."""
+    """Continuously process due jobs."""
 
     initialize_jobs_table()
+
     recovered = recover_stale_jobs()
 
     logger.info(
