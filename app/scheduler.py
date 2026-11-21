@@ -1,12 +1,14 @@
 
 """VICE_0X scheduling module.
 
-Validates future upload schedules.
-Actual background execution is handled by the scheduler worker.
+Validates future upload schedules and stores jobs
+in the persistent SQLite queue.
 """
 
 from datetime import datetime, timezone
 from pathlib import Path
+
+from app.worker import add_job
 
 
 class SchedulerError(Exception):
@@ -26,7 +28,7 @@ def schedule_upload(
     video_path: str,
     scheduled_time: str,
 ) -> dict:
-    """Validate and prepare a future upload schedule."""
+    """Validate and save a future upload schedule."""
 
     if not isinstance(video_path, str) or not video_path.strip():
         raise SchedulerError("A valid video path is required.")
@@ -57,13 +59,25 @@ def schedule_upload(
         )
 
     scheduled_utc = scheduled.astimezone(timezone.utc)
-    now_utc = datetime.now(timezone.utc)
 
-    if scheduled_utc <= now_utc:
+    if scheduled_utc <= datetime.now(timezone.utc):
         raise SchedulerError("Schedule must be in the future.")
 
+    resolved_path = str(path.resolve())
+
+    try:
+        job_id = add_job(
+            video_path=resolved_path,
+            scheduled_time=scheduled_utc.isoformat(),
+        )
+    except (ValueError, OSError) as exc:
+        raise SchedulerError(
+            f"Could not save scheduled job: {exc}"
+        ) from exc
+
     return {
-        "video_path": str(path.resolve()),
+        "job_id": job_id,
+        "video_path": resolved_path,
         "scheduled_time": scheduled_utc.isoformat(),
         "status": "scheduled_pending",
     }
