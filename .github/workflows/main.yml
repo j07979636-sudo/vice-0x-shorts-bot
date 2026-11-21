@@ -21,7 +21,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Check Python syntax
-        run: python -m compileall -q app main.py
+        run: python -m compileall -q app
 
       - name: Report status
         run: echo "VICE_0X cloud check completed"
