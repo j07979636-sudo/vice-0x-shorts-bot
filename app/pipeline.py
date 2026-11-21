@@ -8,10 +8,40 @@ from app.editor import edit_short, validate_video
 from app.limits import consume, LimitExceeded
 from app.seo import generate_seo
 from app.transcribe import transcribe_audio
+from app.youtube import upload_video
 
 
 class PipelineError(Exception):
     """Raised when pipeline processing fails."""
+
+
+def _get_upload_metadata(seo: dict, topic: str) -> tuple:
+    """Prepare safe YouTube metadata from SEO output."""
+
+    if not isinstance(seo, dict):
+        raise PipelineError("SEO generator returned invalid metadata.")
+
+    title = seo.get("title") or topic
+    description = seo.get("description") or topic
+
+    tags = seo.get("tags", [])
+
+    if not tags:
+        tags = seo.get("hashtags", [])
+
+    if isinstance(tags, str):
+        tags = tags.split()
+
+    if not isinstance(tags, list):
+        tags = []
+
+    clean_tags = [
+        tag.strip().lstrip("#")
+        for tag in tags
+        if isinstance(tag, str) and tag.strip()
+    ]
+
+    return title, description, clean_tags
 
 
 def process_video(
@@ -19,7 +49,7 @@ def process_video(
     topic: str,
     output_path: str | None = None,
 ) -> dict:
-    """Transcribe, prepare metadata and render a vertical Short."""
+    """Process a video and upload the finished Short to YouTube."""
 
     if not isinstance(topic, str) or not topic.strip():
         raise ValueError("Video topic cannot be empty.")
@@ -49,7 +79,9 @@ def process_video(
         transcript = transcribe_audio(str(source))
 
         if not transcript.strip():
-            raise PipelineError("No speech was detected in the video.")
+            raise PipelineError(
+                "No speech was detected in the video."
+            )
 
         captions = create_captions(transcript)
         seo = generate_seo(topic.strip())
@@ -59,14 +91,37 @@ def process_video(
             str(destination),
         )
 
+        rendered_path = Path(rendered_video)
+
+        if not rendered_path.is_file():
+            raise PipelineError(
+                "Video editor did not create the output file."
+            )
+
+        title, description, tags = _get_upload_metadata(
+            seo,
+            topic.strip(),
+        )
+
+        upload_result = upload_video(
+            video_path=str(rendered_path),
+            title=title,
+            description=description,
+            tags=tags,
+        )
+
         return {
             "original_video": str(source.resolve()),
-            "processed_video": rendered_video,
+            "processed_video": str(rendered_path.resolve()),
             "topic": topic.strip(),
             "transcript": transcript,
             "captions": captions,
             "seo": seo,
-            "status": "prepared",
+            "youtube": upload_result,
+            "youtube_url": upload_result["url"],
+            "youtube_video_id": upload_result["video_id"],
+            "privacy": "unlisted",
+            "status": "uploaded",
         }
 
     except LimitExceeded:
@@ -77,6 +132,6 @@ def process_video(
 
     except Exception as exc:
         raise PipelineError(
-            f"Video processing failed: {exc}"
+            f"Video processing or upload failed: {exc}"
         ) from exc
         
