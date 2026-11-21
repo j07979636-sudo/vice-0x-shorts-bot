@@ -3,6 +3,9 @@ name: VICE_0X Cloud Check
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   cloud-check:
@@ -23,6 +26,9 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q app
 
+      - name: Build Docker image
+        run: docker build -t vice-0x-shorts-bot:latest .
+
       - name: Report status
-        run: echo "VICE_0X cloud check completed"
+        run: echo "VICE_0X Docker build check completed"
         
