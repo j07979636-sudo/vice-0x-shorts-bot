@@ -51,15 +51,17 @@ def get_youtube_service():
 
     try:
         credentials.refresh(Request())
+
         return build(
             "youtube",
             "v3",
             credentials=credentials,
             cache_discovery=False,
         )
+
     except Exception as exc:
         raise YouTubeUploadError(
-            f"YouTube authentication failed: {exc}"
+            "YouTube authentication failed. Check OAuth credentials."
         ) from exc
 
 
@@ -69,12 +71,15 @@ def upload_video(
     description: str,
     tags: list[str] | None = None,
 ) -> dict:
-    """Upload an authorized video to YouTube."""
+    """Upload an authorized video to YouTube as Unlisted."""
 
     path = Path(video_path)
 
     if not path.is_file():
         raise FileNotFoundError(f"Video not found: {path}")
+
+    if path.suffix.lower() != ".mp4":
+        raise ValueError("Only MP4 videos are supported.")
 
     if not isinstance(title, str) or not title.strip():
         raise ValueError("Video title cannot be empty.")
@@ -94,16 +99,20 @@ def upload_video(
 
     service = get_youtube_service()
 
+    clean_tags = [
+        tag.strip()[:100]
+        for tag in (tags or [])[:30]
+    ]
+
     body = {
         "snippet": {
             "title": title.strip()[:100],
             "description": description[:5000],
-            "tags": (tags or [])[:30],
-            "categoryId": "20",
+            "tags": clean_tags,
+            "categoryId": os.getenv("YOUTUBE_CATEGORY_ID", "20"),
         },
         "status": {
-             "privacyStatus": "unlisted",
-            "selfDeclaredMadeForKids": False,
+            "privacyStatus": "unlisted",
         },
     }
 
@@ -113,6 +122,7 @@ def upload_video(
         media = MediaFileUpload(
             str(path),
             mimetype="video/mp4",
+            chunksize=8 * 1024 * 1024,
             resumable=True,
         )
 
@@ -125,15 +135,20 @@ def upload_video(
         response = None
 
         while response is None:
-            _, response = request.next_chunk()
+            _, response = request.next_chunk(num_retries=5)
+
+        video_id = response.get("id")
+
+        if not video_id:
+            raise YouTubeUploadError(
+                "YouTube did not return a video ID."
+            )
 
         return {
-            "video_id": response.get("id"),
+            "video_id": video_id,
             "status": "uploaded",
-            "privacy": "private",
-            "url": (
-                f"https://www.youtube.com/watch?v={response.get('id')}"
-            ),
+            "privacy": "unlisted",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
         }
 
     except HttpError as exc:
@@ -141,9 +156,11 @@ def upload_video(
             f"YouTube API error: {exc}"
         ) from exc
 
+    except YouTubeUploadError:
+        raise
+
     except Exception as exc:
-        if isinstance(exc, YouTubeUploadError):
-            raise
         raise YouTubeUploadError(
             f"Upload failed: {exc}"
         ) from exc
+        
