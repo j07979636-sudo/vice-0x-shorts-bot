@@ -1,6 +1,7 @@
+
 """VICE_0X database module.
 
-Stores daily automation usage counters in SQLite.
+Stores daily automation usage and scheduled jobs in SQLite.
 """
 
 import sqlite3
@@ -15,7 +16,7 @@ def get_connection():
     db_path = Path(settings.data_dir) / "vice0x.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    connection = sqlite3.connect(db_path)
+    connection = sqlite3.connect(db_path, timeout=30)
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -26,11 +27,22 @@ def initialize_database():
         connection.execute("""
             CREATE TABLE IF NOT EXISTS daily_usage (
                 day TEXT PRIMARY KEY,
-                videos_processed INTEGER DEFAULT 0,
-                uploads_completed INTEGER DEFAULT 0,
-                api_calls INTEGER DEFAULT 0
+                videos_processed INTEGER NOT NULL DEFAULT 0,
+                uploads_completed INTEGER NOT NULL DEFAULT 0,
+                api_calls INTEGER NOT NULL DEFAULT 0
             )
         """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_path TEXT NOT NULL,
+                scheduled_time TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )
+        """)
+
         connection.commit()
 
 
@@ -48,6 +60,7 @@ def get_daily_usage():
             "INSERT OR IGNORE INTO daily_usage (day) VALUES (?)",
             (get_today(),),
         )
+
         row = connection.execute(
             "SELECT * FROM daily_usage WHERE day = ?",
             (get_today(),),
@@ -65,17 +78,23 @@ def increment_usage(counter, amount=1):
     }
 
     if counter not in allowed:
-        raise ValueError("Unsupported usage counter")
+        raise ValueError("Unsupported usage counter.")
 
-    if not isinstance(amount, int) or amount < 0:
-        raise ValueError("Amount must be a non-negative integer")
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+        raise ValueError("Amount must be a non-negative integer.")
 
     initialize_database()
 
     with get_connection() as connection:
         connection.execute(
+            "INSERT OR IGNORE INTO daily_usage (day) VALUES (?)",
+            (get_today(),),
+        )
+
+        connection.execute(
             f"UPDATE daily_usage SET {counter} = {counter} + ? WHERE day = ?",
             (amount, get_today()),
         )
+
         connection.commit()
         
