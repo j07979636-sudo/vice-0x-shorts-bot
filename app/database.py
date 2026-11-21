@@ -1,4 +1,3 @@
-
 """VICE_0X database module.
 
 Stores daily automation usage counters in SQLite.
@@ -13,7 +12,7 @@ from app.config import settings
 
 def get_connection():
     """Create a connection to the application database."""
-    db_path = Path(settings.DATABASE_PATH)
+    db_path = Path(settings.data_dir) / "vice0x.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     connection = sqlite3.connect(db_path)
@@ -79,4 +78,4 @@ def increment_usage(counter, amount=1):
             (amount, get_today()),
         )
         connection.commit()
-      
+        
