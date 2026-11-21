@@ -1,28 +1,30 @@
 
 """VICE_0X background worker.
 
-Claims due jobs safely and validates their input files.
-Actual video processing and YouTube uploading are separate stages.
+Processes due video jobs through the transcription and editing pipeline.
+YouTube publishing is handled as a separate stage.
 """
 
 import logging
 import os
+import re
 import socket
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from app.config import settings
 from app.database import get_connection, initialize_database
 
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 30
-JOB_TIMEOUT_MINUTES = 30
+JOB_TIMEOUT_MINUTES = 120
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 
 def initialize_jobs_table():
-    """Create the scheduled jobs table."""
+    """Create the scheduled jobs table and migrate older databases."""
 
     initialize_database()
 
@@ -36,11 +38,11 @@ def initialize_jobs_table():
                 created_at TEXT NOT NULL,
                 claimed_at TEXT,
                 worker_id TEXT,
-                error_message TEXT
+                error_message TEXT,
+                processed_path TEXT
             )
         """)
 
-        # Add columns safely for databases created by older versions.
         columns = {
             row["name"]
             for row in connection.execute(
@@ -52,6 +54,7 @@ def initialize_jobs_table():
             "claimed_at": "TEXT",
             "worker_id": "TEXT",
             "error_message": "TEXT",
+            "processed_path": "TEXT",
         }
 
         for name, definition in migrations.items():
@@ -64,7 +67,7 @@ def initialize_jobs_table():
 
 
 def add_job(video_path: str, scheduled_time: str) -> int:
-    """Save a future schedule to the database."""
+    """Save a future video-processing job."""
 
     if not isinstance(video_path, str) or not video_path.strip():
         raise ValueError("A valid video path is required.")
@@ -72,11 +75,9 @@ def add_job(video_path: str, scheduled_time: str) -> int:
     if not isinstance(scheduled_time, str) or not scheduled_time.strip():
         raise ValueError("A scheduled time is required.")
 
-    scheduled_text = scheduled_time.strip()
-
     try:
         scheduled = datetime.fromisoformat(
-            scheduled_text.replace("Z", "+00:00")
+            scheduled_time.strip().replace("Z", "+00:00")
         )
     except ValueError as exc:
         raise ValueError("Invalid ISO 8601 scheduled time.") from exc
@@ -99,7 +100,7 @@ def add_job(video_path: str, scheduled_time: str) -> int:
             VALUES (?, ?, 'pending', ?)
             """,
             (
-                video_path.strip(),
+                str(Path(video_path).expanduser().resolve()),
                 scheduled.isoformat(),
                 datetime.now(timezone.utc).isoformat(),
             ),
@@ -108,28 +109,8 @@ def add_job(video_path: str, scheduled_time: str) -> int:
         return cursor.lastrowid
 
 
-def get_due_jobs() -> list[dict]:
-    """Return currently pending jobs that are due."""
-
-    initialize_jobs_table()
-    now = datetime.now(timezone.utc).isoformat()
-
-    with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT * FROM scheduled_jobs
-            WHERE status = 'pending'
-              AND scheduled_time <= ?
-            ORDER BY scheduled_time ASC
-            """,
-            (now,),
-        ).fetchall()
-
-    return [dict(row) for row in rows]
-
-
 def claim_due_jobs(limit: int = 5) -> list[dict]:
-    """Atomically claim due jobs so multiple workers do not claim the same job."""
+    """Atomically claim due jobs."""
 
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("Job limit must be a positive integer.")
@@ -158,7 +139,8 @@ def claim_due_jobs(limit: int = 5) -> list[dict]:
                 UPDATE scheduled_jobs
                 SET status = 'processing',
                     claimed_at = ?,
-                    worker_id = ?
+                    worker_id = ?,
+                    error_message = NULL
                 WHERE id = ? AND status = 'pending'
                 """,
                 (now, WORKER_ID, row["id"]),
@@ -169,7 +151,6 @@ def claim_due_jobs(limit: int = 5) -> list[dict]:
                     "SELECT * FROM scheduled_jobs WHERE id = ?",
                     (row["id"],),
                 ).fetchone()
-
                 claimed.append(dict(job))
 
         connection.commit()
@@ -181,8 +162,9 @@ def mark_job_status(
     job_id: int,
     status: str,
     error_message: str | None = None,
+    processed_path: str | None = None,
 ) -> None:
-    """Update a job status and clear its worker claim when finished."""
+    """Update a job's status and processing result."""
 
     allowed = {"pending", "processing", "completed", "failed"}
 
@@ -195,6 +177,7 @@ def mark_job_status(
             UPDATE scheduled_jobs
             SET status = ?,
                 error_message = ?,
+                processed_path = COALESCE(?, processed_path),
                 claimed_at = CASE
                     WHEN ? = 'processing' THEN claimed_at
                     ELSE NULL
@@ -208,6 +191,7 @@ def mark_job_status(
             (
                 status,
                 error_message[:1000] if error_message else None,
+                processed_path,
                 status,
                 status,
                 job_id,
@@ -217,7 +201,7 @@ def mark_job_status(
 
 
 def recover_stale_jobs():
-    """Return jobs abandoned by a worker to pending status."""
+    """Requeue jobs abandoned beyond the timeout."""
 
     initialize_jobs_table()
 
@@ -245,33 +229,60 @@ def recover_stale_jobs():
 
 
 def process_job(job: dict) -> None:
-    """Validate a claimed job without uploading it yet."""
+    """Process a claimed video through the application pipeline."""
 
     job_id = job["id"]
-    path = Path(job["video_path"])
+    source = Path(job["video_path"])
 
     try:
-        if not path.is_file():
+        if not source.is_file():
             raise FileNotFoundError(
-                f"Scheduled video no longer exists: {path}"
+                f"Scheduled video no longer exists: {source}"
             )
 
-        logger.info(
-            "Job %s is ready for the video-processing stage.",
-            job_id,
+        # Derive a basic topic from the uploaded filename.
+        topic = re.sub(r"[_-]+", " ", source.stem).strip()
+        if not topic:
+            topic = "Gaming Shorts"
+
+        output_dir = Path(settings.data_dir) / "processed"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        output_path = output_dir / f"job_{job_id}_short.mp4"
+
+        # Import only when a job is ready to run.
+        from app.pipeline import process_video
+
+        result = process_video(
+            video_path=str(source),
+            topic=topic,
+            output_path=str(output_path),
         )
 
-        # Actual editing and YouTube publishing will be connected
-        # after the processing pipeline is tested.
-        mark_job_status(job_id, "pending")
+        rendered = Path(result["processed_video"])
+
+        if not rendered.is_file() or rendered.stat().st_size == 0:
+            raise RuntimeError("Pipeline did not produce a valid video.")
+
+        mark_job_status(
+            job_id,
+            "completed",
+            processed_path=str(rendered.resolve()),
+        )
+
+        logger.info(
+            "Job %s completed. Output: %s",
+            job_id,
+            rendered,
+        )
 
     except Exception as exc:
-        logger.exception("Job %s failed validation.", job_id)
+        logger.exception("Job %s failed.", job_id)
         mark_job_status(job_id, "failed", str(exc))
 
 
 def run_worker():
-    """Continuously claim and validate due jobs."""
+    """Continuously claim and process due jobs."""
 
     initialize_jobs_table()
     recovered = recover_stale_jobs()
@@ -297,4 +308,4 @@ def run_worker():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     run_worker()
-            
+    
