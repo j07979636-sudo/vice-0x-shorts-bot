@@ -29,6 +29,23 @@ jobs:
       - name: Build Docker image
         run: docker build -t vice-0x-shorts-bot:latest .
 
-      - name: Report status
-        run: echo "VICE_0X Docker build check completed"
+      - name: Start Docker container
+        run: docker run -d --name vice0x-test -p 7860:7860 vice-0x-shorts-bot:latest
+
+      - name: Test application health
+        run: |
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:7860/health; then
+              echo "VICE_0X health check passed"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs vice0x-test
+          exit 1
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f vice0x-test || true
         
