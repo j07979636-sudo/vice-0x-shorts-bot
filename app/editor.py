@@ -1,6 +1,8 @@
+
 """VICE_0X video editing module.
 
-Uses FFmpeg to convert authorized videos into vertical YouTube Shorts.
+Converts authorized videos into vertical YouTube Shorts
+and optionally burns subtitles into the video.
 """
 
 import shutil
@@ -22,9 +24,9 @@ SUPPORTED_FORMATS = {
 
 
 def validate_video(video_path: str) -> Path:
-    """Validate that the input video exists and has a supported format."""
+    """Validate that the input video exists and is supported."""
 
-    path = Path(video_path)
+    path = Path(video_path).expanduser()
 
     if not path.is_file():
         raise FileNotFoundError(f"Video not found: {path}")
@@ -32,26 +34,82 @@ def validate_video(video_path: str) -> Path:
     if path.suffix.lower() not in SUPPORTED_FORMATS:
         raise VideoEditorError("Unsupported video format.")
 
-    return path
+    return path.resolve()
 
 
-def edit_short(input_path: str, output_path: str) -> str:
-    """Convert a video into a vertical 1080x1920 MP4 Short."""
+def _escape_subtitle_path(path: Path) -> str:
+    """Escape a subtitle path for the FFmpeg filter."""
+
+    value = str(path.resolve())
+
+    for char in ("\\", ":", "'", ",", "[", "]"):
+        value = value.replace(char, "\\" + char)
+
+    return value
+
+
+def edit_short(
+    input_path: str,
+    output_path: str,
+    subtitle_path: str | None = None,
+) -> str:
+    """Convert video to vertical MP4 and optionally burn subtitles."""
 
     source = validate_video(input_path)
-    destination = Path(output_path)
+    destination = Path(output_path).expanduser()
 
     if destination.suffix.lower() != ".mp4":
         raise VideoEditorError("Output file must use .mp4 format.")
 
     if source.resolve() == destination.resolve():
-        raise VideoEditorError("Input and output files must be different.")
+        raise VideoEditorError(
+            "Input and output files must be different."
+        )
+
+    if subtitle_path is not None:
+        subtitles = Path(subtitle_path).expanduser()
+
+        if not subtitles.is_file():
+            raise FileNotFoundError(
+                f"Subtitle file not found: {subtitles}"
+            )
+
+        if subtitles.suffix.lower() != ".srt":
+            raise VideoEditorError("Subtitle file must use .srt format.")
+
+        subtitle_filter = (
+            "subtitles=filename='"
+            + _escape_subtitle_path(subtitles)
+            + "':force_style='"
+            "FontName=DejaVu Sans,"
+            "FontSize=18,"
+            "PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,"
+            "BorderStyle=1,"
+            "Outline=2,"
+            "Shadow=1,"
+            "Alignment=2,"
+            "MarginV=150"
+            "'"
+        )
+
+        video_filter = (
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,setsar=1,"
+            + subtitle_filter
+        )
+
+    else:
+        video_filter = (
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,setsar=1"
+        )
 
     ffmpeg = shutil.which("ffmpeg")
 
     if not ffmpeg:
         raise VideoEditorError(
-            "FFmpeg is not installed. Install FFmpeg before editing."
+            "FFmpeg is not installed."
         )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -62,12 +120,11 @@ def edit_short(input_path: str, output_path: str) -> str:
         "-i", str(source),
         "-map", "0:v:0",
         "-map", "0:a?",
-        "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,setsar=1",
+        "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
@@ -85,14 +142,22 @@ def edit_short(input_path: str, output_path: str) -> str:
 
         if result.returncode != 0:
             raise VideoEditorError(
-                f"FFmpeg rendering failed: {result.stderr[-1500:]}"
+                "FFmpeg rendering failed: "
+                + result.stderr[-1500:]
             )
 
-        if not destination.is_file() or destination.stat().st_size == 0:
-            raise VideoEditorError("Rendering failed: output file is empty.")
+        if (
+            not destination.is_file()
+            or destination.stat().st_size == 0
+        ):
+            raise VideoEditorError(
+                "Rendering failed: output file is empty."
+            )
 
-        return str(destination)
+        return str(destination.resolve())
 
     except subprocess.TimeoutExpired as exc:
-        raise VideoEditorError("Video rendering timed out.") from exc
+        raise VideoEditorError(
+            "Video rendering timed out."
+        ) from exc
         
