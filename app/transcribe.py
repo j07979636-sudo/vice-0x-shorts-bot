@@ -1,12 +1,12 @@
-
 """VICE_0X audio transcription module."""
 
 import shutil
-import subprocess
-import tempfile
 from pathlib import Path
 
-from faster_whisper import WhisperModel
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
 
 
 class TranscriptionError(Exception):
@@ -22,8 +22,6 @@ _model = None
 
 
 def validate_audio(audio_path: str) -> Path:
-    """Validate audio or video input."""
-
     path = Path(audio_path)
 
     if not path.is_file():
@@ -36,9 +34,12 @@ def validate_audio(audio_path: str) -> Path:
 
 
 def get_model():
-    """Load the transcription model only when needed."""
-
     global _model
+
+    if WhisperModel is None:
+        raise TranscriptionError(
+            "Faster-Whisper is unavailable on this device."
+        )
 
     if _model is None:
         try:
@@ -56,8 +57,6 @@ def get_model():
 
 
 def transcribe_audio(audio_path: str) -> str:
-    """Convert speech into text using Faster-Whisper."""
-
     path = validate_audio(audio_path)
 
     if not shutil.which("ffmpeg"):
@@ -88,4 +87,3 @@ def transcribe_audio(audio_path: str) -> str:
         raise TranscriptionError(
             f"Transcription failed: {exc}"
         ) from exc
-        
